@@ -38,6 +38,8 @@ const IP_GRAPHS_REFRESH=90
 const RRD_ROOT="/ssd/rrd/gomapper"
 const RRD_SOCKET="/var/run/rrdcached.sock"
 
+const MAX_INTERPOLATE_INTERVALS=10
+
 var red_db string=REDIS_DB
 
 const IP_REGEX=`^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$`
@@ -60,6 +62,7 @@ type GraphItem struct {
   Key	string
   Item	string
   Value string
+  Uptime uint64
 }
 
 var mainQueue chan GraphItem
@@ -162,7 +165,7 @@ L66:  for !stop_signalled {
           a := strings.Split(reply, " ")
           if len(a) == 4 && ip_reg.MatchString(a[0]) && !opt_Q {
             ip := a[0]
-            uptime := a[1]
+            uptime, _ := strconv.ParseUint(a[1], 10, 64)
             item := a[2]
             value := a[3]
 
@@ -533,12 +536,63 @@ S:for {
               rrdState(false)
               continue S
             } else {
-              data.MkM("created", gi.Ip)[gi.Item] = int64(1)
+               data.MkM("created", gi.Ip)[gi.Item] = int64(1)
             }
           }
           globalMutex.Unlock()
 
-          rrd_err := rrdc.Update(opt_d+"/"+gf, rrd.NewUpdateNow(gi.Value))
+          rrd_file := opt_d+"/"+gf
+
+          last_update_str, _err := redis.String(red.Do("HGET", "ip_graph_updates."+gi.Ip, rrd_file))
+
+          if _err == nil {
+            lu_a := strings.Split(last_update_str, " ")
+            if len(lu_a) == 3 {
+              last_update_time, _err1 := strconv.ParseInt( lu_a[0], 10, 64 )
+              last_update_uptime, _err2 := strconv.ParseUint( lu_a[1], 10, 64 )
+
+              last_update_value, _err3 := strconv.ParseInt( lu_a[2], 10, 64 )
+              new_value, _err4 := strconv.ParseInt( gi.Value, 10, 64 )
+
+              now_time := time.Now().Unix()
+
+              if _err1 == nil && _err2 == nil && _err3 == nil && _err4 == nil {
+                if gi.Uptime > last_update_uptime && (now_time - last_update_time) > 60 && (now_time - last_update_time) < 60*MAX_INTERPOLATE_INTERVALS {
+                  intervals := int64((now_time - last_update_time)/60)+1
+                  timestep := int64((now_time - last_update_time)/intervals)
+                  valuestep := int64((new_value - last_update_value)/intervals)
+                  for i := int64(1); i < intervals; i++ {
+                    cur_time := last_update_time + i*timestep
+                    cur_value := last_update_value + i*valuestep
+
+                    rrd_err := rrdc.Update(rrd_file, rrd.NewUpdate(time.Unix(cur_time, 0), cur_value))
+                    if rrd_err != nil {
+                      if rrd.IsNotExist(rrd_err) {
+                        if opt_v > 1 {
+                          fmt.Println("rrd file gone?:", rrd_err.Error())
+                        }
+                        globalMutex.Lock()
+                        if data.EvA("created", gi.Ip, gi.Item) {
+                          delete(data.VM("created", gi.Ip), gi.Item)
+                        }
+                        globalMutex.Unlock()
+                      } else {
+                        if opt_v > 1 {
+                          fmt.Println("Error updating rrd:", rrd_err.Error())
+                        }
+                        rrdc.Close()
+                        rrdc = nil
+                        rrdState(false)
+                      }
+                      continue S
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          rrd_err := rrdc.Update(rrd_file, rrd.NewUpdateNow(gi.Value))
           if rrd_err != nil {
             if rrd.IsNotExist(rrd_err) {
               if opt_v > 1 {
@@ -558,6 +612,8 @@ S:for {
               rrdState(false)
             }
             continue S
+          } else {
+            red.Do("HSET", "ip_graph_updates."+gi.Ip, rrd_file, strconv.FormatInt(time.Now().Unix(), 10)+" "+strconv.FormatUint( gi.Uptime, 10)+" "+gi.Value)
           }
         } else {
           globalMutex.Unlock()
