@@ -160,10 +160,11 @@ L66:  for !stop_signalled {
           break L66
         case reply := <-rsub.C:
           a := strings.Split(reply, " ")
-          if len(a) == 3 && ip_reg.MatchString(a[0]) && !opt_Q {
-            ip := a[0];
-            item := a[1];
-            value := a[2];
+          if len(a) == 4 && ip_reg.MatchString(a[0]) && !opt_Q {
+            ip := a[0]
+            uptime := a[1]
+            item := a[2]
+            value := a[3]
 
             dot_pos := strings.Index(item, ".")
             var key string
@@ -172,7 +173,7 @@ L66:  for !stop_signalled {
             } else {
               key = item
             }
-            mainQueue <- GraphItem{Ip: ip, Key: key, Item: item, Value: value}
+            mainQueue <- GraphItem{Ip: ip, Key: key, Item: item, Value: value, Uptime: uptime}
           }
         }
       }
